@@ -1,0 +1,6 @@
+{
+  "name": "Detector e Humanizador de Texto com IA",
+  "description": "Ferramenta avançada para detecção de escrita por IA (como Turnitin e GPTZero) e reescrita humanizada ultra-potente para neutralizar detectores.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

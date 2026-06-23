@@ -29,7 +29,7 @@ function getGeminiClient(): GoogleGenAI {
 
 // Robust fallback runner to handle 503 or model unavailability
 async function generateContentWithFallback(ai: GoogleGenAI, config: { contents: string; config: any }) {
-  const models = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-pro", "gemini-1.5-flash"];
+  const models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const model of models) {
@@ -45,8 +45,8 @@ async function generateContentWithFallback(ai: GoogleGenAI, config: { contents: 
     } catch (err: any) {
       console.warn(`Aviso: Falha com o modelo ${model}. Detalhes: ${err.message || JSON.stringify(err)}. Tentando próximo fallback...`);
       lastError = err;
-      // Do not try another model if it's a authorization error
-      if (err.status === 401 || err.status === 403 || (err.message && err.message.includes("API key"))) {
+      // Do not try another model if it's a 401 unauthorized key error
+      if (err.status === 401 || (err.message && err.message.includes("API key") && !err.message.includes("permission"))) {
         throw err;
       }
     }

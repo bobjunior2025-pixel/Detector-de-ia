@@ -22,6 +22,7 @@ import {
   ListRestart
 } from "lucide-react";
 import { DetectionResult, HumanizeResult, SentenceAnalysis } from "./types";
+import { GoogleGenAI, Type } from "@google/genai";
 
 // Dynamic loading status messages for aesthetic wait times or actual states
 const DETECTION_STEPS = [
@@ -55,6 +56,12 @@ export default function App() {
   const [intensity, setIntensity] = useState<"standard" | "high">("high");
   const [language, setLanguage] = useState("Português");
 
+  // Client side API fallback states
+  const [customApiKey, setCustomApiKey] = useState("");
+  const [isStaticDeployError, setIsStaticDeployError] = useState(false);
+  const [showKeyForm, setShowKeyForm] = useState(false);
+  const [tempKeyInput, setTempKeyInput] = useState("");
+
   // State for Detection
   const [isDetecting, setIsDetecting] = useState(false);
   const [detectionStep, setDetectionStep] = useState("");
@@ -71,17 +78,38 @@ export default function App() {
   const [copiedText, setCopiedText] = useState(false);
   const [activeTab, setActiveTab] = useState<"detector" | "humanizer">("detector");
 
-  // Load saved text on mount
+  // Load saved text and key on mount
   useEffect(() => {
     try {
       const saved = localStorage.getItem("humanizai_saved_text");
       if (saved) {
         setInputText(saved);
       }
+      const savedKey = localStorage.getItem("humanizai_custom_gemini_key");
+      if (savedKey) {
+        setCustomApiKey(savedKey);
+        setTempKeyInput(savedKey);
+      }
     } catch (e) {
       console.warn("localStorage não está acessível neste ambiente:", e);
     }
   }, []);
+
+  const handleSaveApiKey = (key: string) => {
+    const cleanKey = key.trim();
+    setCustomApiKey(cleanKey);
+    try {
+      if (cleanKey) {
+        localStorage.setItem("humanizai_custom_gemini_key", cleanKey);
+      } else {
+        localStorage.removeItem("humanizai_custom_gemini_key");
+      }
+      setIsStaticDeployError(false);
+      setError(null);
+    } catch (e) {
+      console.warn("Não foi possível salvar a chave no localStorage:", e);
+    }
+  };
 
   // Intercept uncaught script errors and promise rejections
   useEffect(() => {
@@ -148,6 +176,34 @@ export default function App() {
     return interval;
   };
 
+  // Robust fallback runner to handle 503 or model unavailability on the client-side
+  const generateContentWithFallbackClient = async (ai: any, config: { contents: string; config: any }) => {
+    const models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+    let lastError: any = null;
+
+    for (const model of models) {
+      try {
+        console.log(`Tentando executar requisição cliente com o modelo: ${model}`);
+        const response = await ai.models.generateContent({
+          model: model,
+          contents: config.contents,
+          config: config.config
+        });
+        console.log(`Requisição cliente bem-sucedida usando o modelo: ${model}`);
+        return response;
+      } catch (err: any) {
+        console.warn(`Aviso: Falha com o modelo ${model} no cliente. Detalhes: ${err.message || JSON.stringify(err)}. Tentando próximo fallback...`);
+        lastError = err;
+        // Do not try another model if it's a 401 unauthorized key error
+        if (err.status === 401 || (err.message && err.message.includes("API key") && !err.message.includes("permission"))) {
+          throw err;
+        }
+      }
+    }
+
+    throw lastError || new Error("Todos os de IA disponíveis falharam na execução cliente.");
+  };
+
   // Run AI Detection API Call
   const handleDetect = async () => {
     if (wordCount < 5) {
@@ -161,6 +217,83 @@ export default function App() {
 
     const loaderInterval = runDetectionLoader();
 
+    // Se temos uma chave customizada salva localmente, rodamos direto no cliente para máxima confiabilidade
+    if (customApiKey) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: customApiKey });
+        const prompt = `Analise detalhadamente o seguinte texto para detectar se foi escrito por Inteligência Artificial (como ChatGPT, Gemini, Claude, etc.) ou se é humano.
+Foque na perplexidade (previsibilidade de palavras), burstiness (variação do tamanho e estrutura das sentenças), uso de jargões típicos de IA e padrões repetitivos.
+
+Divida o texto em sentenças lógicas e atribua uma probabilidade aproximada de IA para cada sentença individual de forma justa.
+
+Texto para análise:
+"""
+${inputText}
+"""`;
+
+        const response = await generateContentWithFallbackClient(ai, {
+          contents: prompt,
+          config: {
+            systemInstruction: "Você é um especialista em linguística computacional e detecção de conteúdos gerados por inteligência artificial. Sua análise deve ser minuciosa, equilibrada e justa, assemelhando-se aos melhores detectores do mercado como Turnitin e GPTZero. Você deve retornar estritamente uma resposta estruturada em formato JSON.",
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                score: { type: Type.INTEGER },
+                verdict: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                metrics: {
+                  type: Type.OBJECT,
+                  properties: {
+                    perplexity: { type: Type.INTEGER },
+                    burstiness: { type: Type.INTEGER },
+                    repetition: { type: Type.INTEGER },
+                    vocabulary: { type: Type.INTEGER }
+                  },
+                  required: ["perplexity", "burstiness", "repetition", "vocabulary"]
+                },
+                sentences: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      text: { type: Type.STRING },
+                      score: { type: Type.INTEGER }
+                    },
+                    required: ["text", "score"]
+                  }
+                },
+                clues: { type: Type.ARRAY, items: { type: Type.STRING } },
+                tips: { type: Type.ARRAY, items: { type: Type.STRING } }
+              },
+              required: ["score", "verdict", "summary", "metrics", "sentences", "clues", "tips"]
+            }
+          }
+        });
+
+        const responseText = response.text;
+        if (!responseText) {
+          throw new Error("Resposta do modelo Gemini veio vazia.");
+        }
+
+        const data: DetectionResult = JSON.parse(responseText);
+        setDetectionResult(data);
+        if (data.sentences && data.sentences.length > 0) {
+          setSelectedSentence(data.sentences[0]);
+        }
+        setActiveTab("detector");
+        setIsDetecting(false);
+        clearInterval(loaderInterval);
+        return;
+      } catch (err: any) {
+        console.error("Erro na detecção via cliente:", err);
+        setError(`Erro na chamada direta à API do Gemini: ${err.message || err}`);
+        setIsDetecting(false);
+        clearInterval(loaderInterval);
+        return;
+      }
+    }
+
     try {
       const response = await fetch("/api/detect", {
         method: "POST",
@@ -168,9 +301,21 @@ export default function App() {
         body: JSON.stringify({ text: inputText }),
       });
 
+      const contentType = response.headers.get("Content-Type") || "";
+      if (contentType.includes("text/html")) {
+        setIsStaticDeployError(true);
+        throw new Error("Hospedagem Estática Sem Servidor Ativo (Vercel/GitHub Pages). Ative a execução via Chave API do Gemini local para rodar sem servidor.");
+      }
+
       if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || errData.details || "Erro desconhecido na detecção.");
+        let errText = "";
+        try {
+          const errData = await response.json();
+          errText = errData.error || errData.details;
+        } catch(e) {
+          errText = await response.text();
+        }
+        throw new Error(errText || "Erro desconhecido na detecção.");
       }
 
       const data: DetectionResult = await response.json();
@@ -181,7 +326,12 @@ export default function App() {
       setActiveTab("detector");
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "Erro de conexão com o servidor. Verifique suas credenciais da API Gemini.");
+      if (err.message && (err.message.includes("is not valid JSON") || err.message.includes("Unexpected token"))) {
+        setIsStaticDeployError(true);
+        setError("Ambiente de hospedagem estática detectado (Vercel/GitHub Pages). Configure uma Chave API do Gemini local no painel abaixo para rodar o app de forma autônoma e gratuita!");
+      } else {
+        setError(err.message || "Erro de conexão com o servidor. Verifique suas credenciais da API Gemini.");
+      }
     } finally {
       clearInterval(loaderInterval);
       setIsDetecting(false);
@@ -200,6 +350,85 @@ export default function App() {
 
     const loaderInterval = runHumanizationLoader();
 
+    // Se temos uma chave customizada salva localmente, rodamos direto no cliente
+    if (customApiKey) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: customApiKey });
+        
+        const targetModeStr = mode === "academic" ? "Acadêmico (mantendo rigor metodológico, referências implícitas e precisão, mas com fluxo humano dinâmico e natural)" :
+                              mode === "narrative" ? "Narrativo / Criativo (com storytelling, linguagem descritiva rica e ritmos variados)" :
+                              mode === "conversational" ? "Conversacional / Coloquial (descontraído, com expressões idiomáticas, tom direto, voz ativa forte e variações cotidianas)" :
+                              "Profissional / Corporativo (claro, elegante, direto ao ponto, evitando clichês corporativos robóticos)";
+
+        const intensityStr = intensity === "high" ? "Intensidade Avançada: Reestruture pesadamente as frases. Mude a ordem sintática, quebre clichês previsíveis, use vocabulários ricos e rústicos, intercale sentenças de 3 palavras com sentenças longas, introduza nuances emocionais ou lógicas sutis para passar completamente por Turnitin v2, GPTZero e CopyLeaks." :
+                             "Intensidade Moderada: Altere termos comuns por sinônimos contextualizados, varie o ritmo de pontuação e remova os conectores clichês de IA (como 'em suma', 'além disso', 'é importante destacar').";
+
+        const prompt = `Humanize o seguinte texto para que ele pareça 100% escrito por um ser humano real, garantindo que ele passe sem ser detectado por softwares de detecção de IA (como Turnitin, GPTZero, ZeroGPT, CopyLeaks).
+
+Estilo de Escrita Alvo: ${targetModeStr}
+Nível de Intervenção: ${intensityStr}
+Idioma do Texto de Destino: ${language || 'Português'}
+
+Instruções fundamentais para passar em detectores rigorosos:
+1. **Ritmo de Sentenças Humano (Burstiness)**: Intercale frases muito curtas (frases de impacto, perguntas retóricas) com períodos mais longos e compostos. A inteligência artificial tende a escrever frases com tamanhos de caracteres quase uniformes.
+2. **Vocabulário Imprevisível (High Perplexity)**: Substitua palavras comuns e genéricas por termos menos prováveis, expressões idiomáticas naturais e sinônimos refinados apropriados ao contexto.
+3. **Erradique Clichês de IA**: Remova palavras e conectores de transição robóticos de alta frequência (como 'em suma', 'além disso', 'por fim', 'é crucial', 'vale ressaltar', 'primeiramente', 'em segundo lugar', 'outro aspecto relevante'). Use transições lógicas invisíveis ou conectores humanos casuais (como 'na prática', 'acontece que', 'com isso', 'olhando de perto', 'o resultado disso').
+4. **Voz Ativa**: Prefira a voz ativa ('O pesquisador descobriu...') à voz passiva típica de IA ('Foi descoberto pelo pesquisador...').
+5. **Autenticidade e Personalidade**: Introduza leveza e espontaneidade de raciocínio. O texto resultante deve ser coeso, gramaticalmente correto no idioma solicitado, extremamente profissional (ou adequado ao modo escolhido) e manter INTEGRALMENTE o significado, ideias e fatos originais do texto de entrada.
+
+Texto original a ser humanizado:
+"""
+${inputText}
+"""`;
+
+        const response = await generateContentWithFallbackClient(ai, {
+          contents: prompt,
+          config: {
+            systemInstruction: "Você é um reescritor profissional de textos e especialista sênior em redação humana criativa e acadêmica. Seu único objetivo é reescrever o texto de entrada mantendo 100% de sua mensagem, fatos e precisão, mas convertendo todo o estilo de escrita para uma assinatura linguística perfeitamente humana que neutralize detectores de IA. Retorne o resultado em formato JSON.",
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                humanizedText: { type: Type.STRING },
+                estimatedScore: { type: Type.INTEGER },
+                originalScore: { type: Type.INTEGER },
+                explanations: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      category: { type: Type.STRING },
+                      description: { type: Type.STRING }
+                    },
+                    required: ["category", "description"]
+                  }
+                }
+              },
+              required: ["humanizedText", "estimatedScore", "originalScore", "explanations"]
+            }
+          }
+        });
+
+        const responseText = response.text;
+        if (!responseText) {
+          throw new Error("Resposta de humanização veio vazia.");
+        }
+
+        const data: HumanizeResult = JSON.parse(responseText);
+        setHumanizeResult(data);
+        setActiveTab("humanizer");
+        setIsHumanizing(false);
+        clearInterval(loaderInterval);
+        return;
+      } catch (err: any) {
+        console.error("Erro na humanização via cliente:", err);
+        setError(`Erro na chamada direta ao Gemini: ${err.message || err}`);
+        setIsHumanizing(false);
+        clearInterval(loaderInterval);
+        return;
+      }
+    }
+
     try {
       const response = await fetch("/api/humanize", {
         method: "POST",
@@ -212,9 +441,21 @@ export default function App() {
         }),
       });
 
+      const contentType = response.headers.get("Content-Type") || "";
+      if (contentType.includes("text/html")) {
+        setIsStaticDeployError(true);
+        throw new Error("Hospedagem Estática Sem Servidor Ativo (Vercel/GitHub Pages). Ative a execução via Chave API do Gemini local para rodar sem servidor.");
+      }
+
       if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || errData.details || "Erro desconhecido ao humanizar o texto.");
+        let errText = "";
+        try {
+          const errData = await response.json();
+          errText = errData.error || errData.details;
+        } catch(e) {
+          errText = await response.text();
+        }
+        throw new Error(errText || "Erro desconhecido ao humanizar o texto.");
       }
 
       const data: HumanizeResult = await response.json();
@@ -222,7 +463,12 @@ export default function App() {
       setActiveTab("humanizer");
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "Não foi possível humanizar o texto. Verifique as configurações da API Gemini.");
+      if (err.message && (err.message.includes("is not valid JSON") || err.message.includes("Unexpected token"))) {
+        setIsStaticDeployError(true);
+        setError("Ambiente de hospedagem estática detectado (Vercel/GitHub Pages). Configure uma Chave API do Gemini local no painel abaixo para rodar o app de forma autônoma e gratuita!");
+      } else {
+        setError(err.message || "Não foi possível humanizar o texto. Verifique as configurações da API Gemini.");
+      }
     } finally {
       clearInterval(loaderInterval);
       setIsHumanizing(false);
@@ -299,11 +545,25 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-400 flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
-              Servidor Gemini Ativo
-            </span>
+          <div className="flex items-center gap-3">
+            {customApiKey ? (
+              <span className="text-xs text-indigo-600 bg-indigo-50 border border-indigo-200 px-2.5 py-1 rounded-full flex items-center gap-1.5 font-medium shadow-xs">
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>
+                Gemini: API Direta Ativa
+              </span>
+            ) : (
+              <span className="text-xs text-slate-400 flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+                Servidor Gemini Ativo
+              </span>
+            )}
+            
+            <button
+              onClick={() => setShowKeyForm(!showKeyForm)}
+              className="text-xs text-slate-600 hover:text-slate-900 bg-slate-50 hover:bg-slate-100 px-3 py-1.5 rounded-xl border border-slate-200 transition-all font-semibold flex items-center gap-1 cursor-pointer"
+            >
+              Configurar Chave API
+            </button>
           </div>
         </div>
       </header>
@@ -313,18 +573,118 @@ export default function App() {
         
         {/* Error Notification */}
         {error && (
-          <div className="bg-rose-50 border-l-4 border-rose-500 p-4 rounded-r-xl shadow-sm animate-fade-in flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <h4 className="text-sm font-semibold text-rose-800">Erro na solicitação</h4>
-              <p className="text-xs text-rose-700 mt-1">{error}</p>
+          <div className="bg-rose-50 border-l-4 border-rose-500 p-4 rounded-r-xl shadow-sm animate-fade-in flex flex-col gap-3">
+            <div className="flex items-start gap-3 w-full">
+              <AlertTriangle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <h4 className="text-sm font-semibold text-rose-800">Erro na solicitação</h4>
+                <p className="text-xs text-rose-700 mt-1 leading-relaxed">{error}</p>
+              </div>
+              <button 
+                onClick={() => setError(null)} 
+                className="text-rose-400 hover:text-rose-600 text-xs font-semibold px-2 py-1 rounded-sm cursor-pointer"
+              >
+                Fechar
+              </button>
             </div>
-            <button 
-              onClick={() => setError(null)} 
-              className="text-rose-400 hover:text-rose-600 text-xs font-semibold px-2 py-1 rounded-sm"
-            >
-              Fechar
-            </button>
+
+            {/* Contextual Gemini 403 / Permission error troubleshooting block */}
+            {customApiKey && (error.includes("PERMISSION_DENIED") || error.toLowerCase().includes("permission") || error.includes("403")) && (
+              <div className="bg-white p-4 rounded-xl border border-rose-200 text-xs text-slate-700 flex flex-col gap-3 shadow-xs">
+                <div className="font-bold text-rose-600 flex items-center gap-1.5">
+                  <Sparkles className="w-4 h-4 text-rose-500" />
+                  Como resolver o erro de Permissão (403):
+                </div>
+                <ol className="list-decimal list-inside space-y-2 text-slate-600 pl-1 leading-relaxed">
+                  <li>
+                    <strong>Use o Google AI Studio correto:</strong> Garanta que você criou a chave no portal gratuito do <a href="https://aistudio.google.com/" target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:underline font-semibold">Google AI Studio</a>, e não no painel geral do Google Cloud (GCP). Chaves criadas no Google Cloud Console frequentemente não têm a API <em>"Generative Language API"</em> ativada por padrão.
+                  </li>
+                  <li>
+                    <strong>Ative a Generative Language API:</strong> Se você preferir usar uma chave do Google Cloud Console (GCP), acesse seu console do GCP, selecione seu projeto atual, busque por <strong>"Generative Language API"</strong> na barra de pesquisa e clique em <strong>Ativar (Enable)</strong>.
+                  </li>
+                  <li>
+                    <strong>Região geográfica:</strong> A API do Gemini pode estar restrita em certos países ou se você estiver sob uso de alguma VPN restritiva. Tente desativá-la ou ajustar a região.
+                  </li>
+                  <li>
+                    <strong>Testar outro modelo:</strong> O aplicativo tenta o <em>gemini-2.5-flash</em> e depois faz fallback para o <em>gemini-2.0-flash</em>. Garanta que seu projeto no AI Studio tem cota habilitada para esses modelos.
+                  </li>
+                </ol>
+                <div className="mt-1 pt-3 border-t border-slate-100 flex gap-2 flex-wrap">
+                  <button
+                    onClick={() => {
+                      setShowKeyForm(true);
+                      setError(null);
+                    }}
+                    className="text-[11px] bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold px-3 py-1.5 rounded-lg transition-all cursor-pointer"
+                  >
+                    ⚙️ Alterar Chave de API
+                  </button>
+                  <button
+                    onClick={() => {
+                      handleSaveApiKey("");
+                      setTempKeyInput("");
+                      setError(null);
+                    }}
+                    className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg transition-all cursor-pointer"
+                  >
+                    🗑️ Remover Chave e Usar Servidor Padrão
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Gemini API Key Panel */}
+        {(showKeyForm || isStaticDeployError) && (
+          <div className="bg-gradient-to-r from-indigo-50 to-slate-50 border border-indigo-200/80 p-5 rounded-2xl shadow-xs animate-fade-in flex flex-col md:flex-row md:items-center justify-between gap-5">
+            <div className="flex-1">
+              <h3 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
+                <Sparkles className="w-4 h-4 text-indigo-500" />
+                Configuração de API do Gemini (Uso Autônomo)
+              </h3>
+              <p className="text-xs text-slate-600 mt-1 leading-relaxed max-w-2xl">
+                {isStaticDeployError ? (
+                  <strong className="text-rose-600 font-semibold block mb-1">
+                    ⚠️ Hospedagem Estática Sem Servidor Ativo Detectada!
+                  </strong>
+                ) : null}
+                Este aplicativo foi detectado como hospedado de forma estática pura (como na Vercel ou GitHub Pages). Para fazê-lo funcionar de forma 100% autônoma, insira uma chave de API gratuita do Gemini abaixo.
+                Sua chave fica salva apenas no seu navegador de forma privada. Obtenha uma grátis no <a href="https://aistudio.google.com/" target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:text-indigo-800 font-bold underline">Google AI Studio</a>.
+              </p>
+            </div>
+            
+            <div className="flex items-center gap-2 shrink-0 flex-wrap">
+              <input
+                type="password"
+                placeholder="Insira sua GEMINI_API_KEY..."
+                value={tempKeyInput}
+                onChange={(e) => setTempKeyInput(e.target.value)}
+                className="text-xs px-3 py-2 border border-slate-300 rounded-lg w-64 focus:outline-hidden focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 bg-white shadow-xs"
+              />
+              <button
+                onClick={() => {
+                  handleSaveApiKey(tempKeyInput);
+                  setShowKeyForm(false);
+                }}
+                className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-4 py-2 rounded-lg transition-all shadow-xs shrink-0 cursor-pointer"
+              >
+                Salvar Chave
+              </button>
+              {customApiKey && (
+                <button
+                  onClick={() => {
+                    handleSaveApiKey("");
+                    setTempKeyInput("");
+                    setShowKeyForm(false);
+                  }}
+                  className="text-xs bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold px-3 py-2 rounded-lg transition-all shrink-0 cursor-pointer"
+                  title="Remover Chave"
+                >
+                  Remover
+                </button>
+              )}
+            </div>
           </div>
         )}
 

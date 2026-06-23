@@ -51,6 +51,15 @@ const PASTES = {
 };
 
 export default function App() {
+  const tokenizeText = (text: string): string[] => {
+    if (!text) return [];
+    return text.split(/(\s+|[.,!?;:()""'’‘“”—\-\n]+)/g).filter(v => v !== "");
+  };
+
+  const isWordToken = (token: string) => {
+    return /[A-Za-z0-9À-ÖØ-öø-ÿ]+/g.test(token);
+  };
+
   const [inputText, setInputText] = useState("");
   const [mode, setMode] = useState<"academic" | "professional" | "conversational" | "narrative">("academic");
   const [intensity, setIntensity] = useState<"standard" | "high">("high");
@@ -78,12 +87,33 @@ export default function App() {
   const [copiedText, setCopiedText] = useState(false);
   const [activeTab, setActiveTab] = useState<"detector" | "humanizer">("detector");
 
+  // App view modes: "automatic" (standard detector/humanizer) or "manual" (assisted word synonymizer)
+  const [appMode, setAppMode] = useState<"automatic" | "manual">("automatic");
+
+  // State for Manual Synonym Humanizer
+  const [manualText, setManualText] = useState("");
+  const [manualTokens, setManualTokens] = useState<string[]>([]);
+  const [manualEditorSubTab, setManualEditorSubTab] = useState<"edit" | "interactive">("edit");
+  const [selectedTokenIndex, setSelectedTokenIndex] = useState<number | null>(null);
+  const [isFetchingSynonyms, setIsFetchingSynonyms] = useState(false);
+  const [synonymsSuggestions, setSynonymsSuggestions] = useState<string[]>([]);
+  const [customSynonymInput, setCustomSynonymInput] = useState("");
+  const [manualCopiedText, setManualCopiedText] = useState(false);
+
   // Load saved text and key on mount
   useEffect(() => {
     try {
       const saved = localStorage.getItem("humanizai_saved_text");
       if (saved) {
         setInputText(saved);
+      }
+      const savedManual = localStorage.getItem("humanizai_saved_manual_text");
+      if (savedManual) {
+        setManualText(savedManual);
+        setManualTokens(tokenizeText(savedManual));
+      } else if (saved) {
+        setManualText(saved);
+        setManualTokens(tokenizeText(saved));
       }
       const savedKey = localStorage.getItem("humanizai_custom_gemini_key");
       if (savedKey) {
@@ -495,6 +525,122 @@ ${inputText}
     setError(null);
   };
 
+  // Manual Humanizer Handlers
+  const handleImportToManual = () => {
+    setManualText(inputText);
+    const tokens = tokenizeText(inputText);
+    setManualTokens(tokens);
+    setManualEditorSubTab("interactive");
+    setSelectedTokenIndex(null);
+    setSynonymsSuggestions([]);
+  };
+
+  const handleImportToAutomatic = () => {
+    setInputText(manualText);
+    setAppMode("automatic");
+  };
+
+  const handleManualTextChange = (text: string) => {
+    setManualText(text);
+    const tokens = tokenizeText(text);
+    setManualTokens(tokens);
+    try {
+      localStorage.setItem("humanizai_saved_manual_text", text);
+    } catch (e) {
+      console.warn("Não foi possível salvar manualText no localStorage:", e);
+    }
+  };
+
+  const handleCopyManualText = () => {
+    navigator.clipboard.writeText(manualText);
+    setManualCopiedText(true);
+    setTimeout(() => setManualCopiedText(false), 2000);
+  };
+
+  const fetchSynonymsForWord = async (word: string, surroundingText: string) => {
+    setIsFetchingSynonyms(true);
+    setSynonymsSuggestions([]);
+    setCustomSynonymInput("");
+    try {
+      if (customApiKey) {
+        const ai = new GoogleGenAI({ apiKey: customApiKey });
+        const prompt = `Analise a palavra "${word}" dentro do seguinte texto. Proponha entre 5 e 8 sinônimos inteligentes ou expressões alternativas que mantenham a coesão do texto, mas comecem a torná-lo mais dinâmico, humano e menos mecânico/previsível.
+
+Texto de contexto:
+"""
+${surroundingText || word}
+"""
+
+Retorne estritamente um JSON com uma lista de sugestões.`;
+
+        const response = await generateContentWithFallbackClient(ai, {
+          contents: prompt,
+          config: {
+            systemInstruction: "Você é um assistente sênior de escrita humana e dicionário de sinônimos contextualizados. Forneça termos precisos que possam substituir diretamente a palavra especificada mantendo a concordância de gênero e número. Retorne o resultado estritamente em formato JSON.",
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                suggestions: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: "Alternativas ou sinônimos em português de alta qualidade e com concordância correta."
+                }
+              },
+              required: ["suggestions"]
+            }
+          }
+        });
+
+        const responseText = response.text;
+        if (responseText) {
+          const parsed = JSON.parse(responseText);
+          setSynonymsSuggestions(parsed.suggestions || []);
+        } else {
+          throw new Error("Resposta do modelo de IA vazia.");
+        }
+      } else {
+        const response = await fetch("/api/synonyms", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ word, text: surroundingText }),
+        });
+
+        if (!response.ok) {
+          throw new Error("Erro ao buscar sugestões com o servidor.");
+        }
+
+        const data = await response.json();
+        setSynonymsSuggestions(data.suggestions || []);
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError(`Erro ao buscar sinônimos com IA: ${err.message || "Tente novamente mais tarde."}`);
+    } finally {
+      setIsFetchingSynonyms(false);
+    }
+  };
+
+  const handleReplaceToken = (replacement: string) => {
+    if (selectedTokenIndex === null) return;
+    const cleanWord = replacement.trim();
+    if (!cleanWord) return;
+
+    const newTokens = [...manualTokens];
+    newTokens[selectedTokenIndex] = cleanWord;
+    setManualTokens(newTokens);
+    
+    const newText = newTokens.join("");
+    handleManualTextChange(newText);
+    
+    // Clear selection
+    setSelectedTokenIndex(null);
+    setSynonymsSuggestions([]);
+    setCustomSynonymInput("");
+  };
+
   // UI styling helpers
   const getScoreColor = (score: number) => {
     if (score < 25) return "text-emerald-600 bg-emerald-50 border-emerald-200 hover:bg-emerald-100";
@@ -688,9 +834,63 @@ ${inputText}
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-          
-          {/* LEFT SIDE: Text input and configuration */}
+        {/* Mode Selector Segmented Control */}
+        <div className="flex flex-col sm:flex-row border-b border-[#e2e8f0] pb-4 items-start sm:items-center justify-between gap-4">
+          <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200">
+            <button
+              onClick={() => setAppMode("automatic")}
+              className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                appMode === "automatic"
+                  ? "bg-white text-slate-950 shadow-sm"
+                  : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              <Sparkles className="w-4 h-4 text-indigo-500" />
+              Modo Automático (Detector & IA)
+            </button>
+            <button
+              onClick={() => {
+                setAppMode("manual");
+                if (!manualText && inputText) {
+                  handleImportToManual();
+                }
+              }}
+              className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                appMode === "manual"
+                  ? "bg-white text-slate-950 shadow-sm"
+                  : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              <FileText className="w-4 h-4 text-emerald-500" />
+              Modo Manual Assistido (Substituidor de Palavras)
+            </button>
+          </div>
+
+          {appMode === "automatic" && inputText && (
+            <button
+              onClick={handleImportToManual}
+              className="text-xs bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-700 px-3.5 py-2 rounded-xl font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+            >
+              <ArrowRight className="w-4 h-4" />
+              Transferir para Editor Manual
+            </button>
+          )}
+
+          {appMode === "manual" && manualText && (
+            <button
+              onClick={handleImportToAutomatic}
+              className="text-xs bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 px-3.5 py-2 rounded-xl font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+            >
+              <ArrowRight className="w-4 h-4 rotate-180" />
+              Transferir para Detector Automático
+            </button>
+          )}
+        </div>
+
+        {appMode === "automatic" ? (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+            
+            {/* LEFT SIDE: Text input and configuration */}
           <section className="lg:col-span-7 flex flex-col gap-6">
             
             {/* Input Card */}
@@ -1268,6 +1468,254 @@ ${inputText}
           </section>
 
         </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start animate-fade-in">
+            {/* LEFT COLUMN: Manual Text Area & Clickable Tokens */}
+            <section className="lg:col-span-7 flex flex-col gap-6">
+              
+              {/* Manual Editor Card */}
+              <div className="bg-white border border-[#e2e8f0] rounded-2xl shadow-xs overflow-hidden">
+                <div className="p-4 border-b border-[#e2e8f0] bg-slate-50/50 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-slate-600 font-semibold uppercase tracking-wider flex items-center gap-1.5">
+                      <FileText className="w-4 h-4 text-emerald-500" />
+                      Espaço de Humanização Manual
+                    </span>
+                  </div>
+
+                  {/* Sub Tabs for writing vs clicking */}
+                  <div className="flex bg-slate-150 p-1 rounded-lg">
+                    <button
+                      onClick={() => setManualEditorSubTab("edit")}
+                      className={`px-3 py-1 text-xs font-bold rounded-md transition-all cursor-pointer ${
+                        manualEditorSubTab === "edit"
+                          ? "bg-white text-slate-900 shadow-xs"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      ✏️ Digitar / Colar
+                    </button>
+                    <button
+                      onClick={() => {
+                        setManualEditorSubTab("interactive");
+                        setSelectedTokenIndex(null);
+                        setSynonymsSuggestions([]);
+                      }}
+                      className={`px-3 py-1 text-xs font-bold rounded-md transition-all cursor-pointer ${
+                        manualEditorSubTab === "interactive"
+                          ? "bg-white text-slate-900 shadow-xs"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      🖱️ Substituir Palavras
+                    </button>
+                  </div>
+                </div>
+
+                {/* Sub Tab 1: Edit Mode */}
+                {manualEditorSubTab === "edit" && (
+                  <div className="p-5">
+                    <textarea
+                      className="w-full h-80 p-4 text-slate-800 placeholder-slate-400 text-sm border border-slate-200 rounded-xl focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 resize-none leading-relaxed animate-fade-in"
+                      placeholder="Insira ou cole seu texto aqui..."
+                      value={manualText}
+                      onChange={(e) => handleManualTextChange(e.target.value)}
+                    />
+                    <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
+                      <span>Palavras: <strong className="text-slate-800 font-medium">{manualText.trim() === "" ? 0 : manualText.trim().split(/\s+/).length}</strong></span>
+                      <span>Caracteres: <strong className="text-slate-800 font-medium">{manualText.length}</strong></span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Sub Tab 2: Interactive Substitution Mode */}
+                {manualEditorSubTab === "interactive" && (
+                  <div className="p-5 animate-fade-in">
+                    {manualTokens.length === 0 ? (
+                      <div className="py-12 text-center flex flex-col items-center justify-center gap-3">
+                        <div className="w-12 h-12 rounded-full bg-slate-50 border border-slate-100 flex items-center justify-center text-slate-400">
+                          <FileText className="w-5 h-5" />
+                        </div>
+                        <p className="text-xs text-slate-500 max-w-sm">
+                          O texto está vazio! Escreva ou cole algo na aba <strong>✏️ Digitar / Colar</strong> ou clique em <strong>"Transferir para Editor Manual"</strong> acima para começar.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-4">
+                        <p className="text-xs text-slate-500">
+                          💡 <strong>Como usar:</strong> Clique em qualquer palavra grifada em azul para pesquisar sinônimos sugeridos por IA no painel ao lado e substituí-la instantaneamente.
+                        </p>
+
+                        <div className="bg-slate-50/80 p-5 rounded-xl border border-slate-200/80 max-h-[380px] overflow-y-auto leading-relaxed text-sm whitespace-pre-wrap select-none shadow-inner">
+                          {manualTokens.map((token, idx) => {
+                            const word = isWordToken(token);
+                            if (word) {
+                              const isSelected = selectedTokenIndex === idx;
+                              return (
+                                <span
+                                  key={idx}
+                                  onClick={() => {
+                                    setSelectedTokenIndex(idx);
+                                    fetchSynonymsForWord(token, manualText);
+                                  }}
+                                  className={`inline-block mx-0.5 rounded px-1 transition-all cursor-pointer duration-150 ${
+                                    isSelected
+                                      ? "bg-emerald-600 text-white font-bold shadow-xs scale-105"
+                                      : "text-indigo-600 hover:bg-indigo-50 hover:text-indigo-800 border-b border-indigo-200"
+                                  }`}
+                                  title="Clique para ver alternativas com IA"
+                                >
+                                  {token}
+                                </span>
+                              );
+                            } else {
+                              return <span key={idx}>{token}</span>;
+                            }
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </section>
+
+            {/* RIGHT COLUMN: Synonym lookup details & controls */}
+            <section className="lg:col-span-5 flex flex-col gap-6">
+              
+              {/* Interactive Synonym Panel */}
+              <div className="bg-white border border-[#e2e8f0] rounded-2xl p-6 shadow-xs flex flex-col gap-5 min-h-[350px]">
+                {selectedTokenIndex === null ? (
+                  <div className="flex-1 flex flex-col items-center justify-center text-center py-10">
+                    <div className="w-12 h-12 rounded-full bg-slate-50 flex items-center justify-center text-slate-400 mb-3 border border-slate-100">
+                      <Sparkles className="w-5 h-5 text-emerald-500 animate-pulse" />
+                    </div>
+                    <h3 className="text-sm font-bold text-slate-800">Assistente de Sinônimos IA</h3>
+                    <p className="text-xs text-slate-500 mt-2 max-w-xs leading-relaxed">
+                      Selecione uma palavra no texto interativo ao lado para ver sugestões inteligentes de sinônimos contextuais gerados pelo Gemini.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-4 animate-fade-in">
+                    <div className="border-b border-slate-100 pb-3">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wide block">
+                        Palavra Selecionada
+                      </span>
+                      <h3 className="text-base font-extrabold text-slate-800 flex items-center gap-1.5 mt-0.5">
+                        <span className="bg-emerald-50 text-emerald-700 px-2.5 py-0.5 rounded-lg border border-emerald-150">
+                          {manualTokens[selectedTokenIndex]}
+                        </span>
+                      </h3>
+                    </div>
+
+                    {/* AI Loading State */}
+                    {isFetchingSynonyms ? (
+                      <div className="py-8 text-center flex flex-col items-center gap-3">
+                        <span className="w-6 h-6 rounded-full border-2 border-emerald-600 border-t-transparent animate-spin"></span>
+                        <span className="text-xs text-slate-500 font-medium animate-pulse">
+                          Consultando o Gemini para sinônimos naturais...
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-4">
+                        {/* Synonym badges */}
+                        <div>
+                          <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wide block mb-2">
+                            ✨ Alternativas Inteligentes com IA:
+                          </label>
+                          {synonymsSuggestions.length === 0 ? (
+                            <p className="text-xs text-slate-400 italic">
+                              Nenhuma sugestão encontrada ou falha de conexão. Tente digitar seu próprio termo abaixo.
+                            </p>
+                          ) : (
+                            <div className="flex flex-wrap gap-2">
+                              {synonymsSuggestions.map((suggestion, idx) => (
+                                <button
+                                  key={idx}
+                                  onClick={() => handleReplaceToken(suggestion)}
+                                  className="text-xs bg-slate-50 hover:bg-emerald-50 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 px-3 py-1.5 rounded-lg transition-all font-semibold cursor-pointer flex items-center gap-1"
+                                >
+                                  {suggestion}
+                                  <ChevronRight className="w-3 h-3 text-slate-400" />
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Custom Replacement Input */}
+                        <div className="border-t border-slate-100 pt-4 flex flex-col gap-2">
+                          <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wide block">
+                            ✍️ Digitar termo próprio:
+                          </label>
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              placeholder="Digite uma palavra..."
+                              value={customSynonymInput}
+                              onChange={(e) => setCustomSynonymInput(e.target.value)}
+                              className="text-xs px-3 py-2 border border-slate-300 rounded-lg flex-1 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white"
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") handleReplaceToken(customSynonymInput);
+                              }}
+                            />
+                            <button
+                              onClick={() => handleReplaceToken(customSynonymInput)}
+                              disabled={!customSynonymInput.trim()}
+                              className="text-xs bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold px-4 py-2 rounded-lg transition-all cursor-pointer"
+                            >
+                              Aplicar
+                            </button>
+                          </div>
+                        </div>
+
+                        <p className="text-[10px] text-slate-400 mt-2 italic leading-relaxed">
+                          * As sugestões do Gemini analisam toda a frase para garantir que a concordância verbal, gênero e número permaneçam corretos.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Action and Copy Panel */}
+              <div className="bg-white border border-[#e2e8f0] rounded-2xl p-5 shadow-xs flex flex-col gap-4">
+                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                  Exportar Resultado
+                </span>
+
+                <button
+                  onClick={handleCopyManualText}
+                  disabled={!manualText}
+                  className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm tracking-wide disabled:opacity-50 transition-all shadow-sm cursor-pointer"
+                >
+                  {manualCopiedText ? (
+                    <>
+                      <Check className="w-4 h-4 text-emerald-400" />
+                      <span>Texto Copiado!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-4 h-4" />
+                      <span>Copiar Texto Final</span>
+                    </>
+                  )}
+                </button>
+                
+                {manualText && (
+                  <button
+                    onClick={handleImportToAutomatic}
+                    className="text-xs text-indigo-600 hover:text-indigo-800 font-bold transition-colors text-center inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <ListRestart className="w-3.5 h-3.5" />
+                    Enviar este texto para a detecção automática
+                  </button>
+                )}
+              </div>
+
+            </section>
+          </div>
+        )}
 
       </main>
 

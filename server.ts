@@ -280,6 +280,70 @@ ${text}
     }
   });
 
+  // API Route: Contextual Synonyms Suggestion
+  app.post("/api/synonyms", async (req, res) => {
+    try {
+      const { word, text } = req.body;
+      if (!word || typeof word !== "string" || word.trim() === "") {
+        return res.status(400).json({
+          error: "A palavra para busca de sinônimos é obrigatória."
+        });
+      }
+
+      // Check key
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({
+          error: "Chave API do Gemini ausente. Por favor, configure a variável 'GEMINI_API_KEY' nas Configurações de Segredos (Settings > Secrets) do AI Studio."
+        });
+      }
+
+      const ai = getGeminiClient();
+
+      const prompt = `Analise a palavra "${word}" dentro do seguinte texto. Proponha entre 5 e 8 sinônimos inteligentes ou expressões alternativas que mantenham a coesão do texto, mas comecem a torná-lo mais dinâmico, humano e menos mecânico/previsível.
+
+Texto de contexto:
+"""
+${text || word}
+"""
+
+Retorne estritamente um JSON com uma lista de sugestões.`;
+
+      const response = await generateContentWithFallback(ai, {
+        contents: prompt,
+        config: {
+          systemInstruction: "Você é um assistente sênior de escrita humana e dicionário de sinônimos contextualizados. Forneça termos precisos que possam substituir diretamente a palavra especificada mantendo a concordância de gênero e número. Retorne o resultado estritamente em formato JSON.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              suggestions: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Alternativas ou sinônimos em português de alta qualidade e com concordância correta."
+              }
+            },
+            required: ["suggestions"]
+          }
+        }
+      });
+
+      const responseText = response.text;
+      if (!responseText) {
+        throw new Error("Não foi possível obter resposta do modelo de IA para os sinônimos.");
+      }
+
+      const result = JSON.parse(responseText);
+      res.json(result);
+
+    } catch (error: any) {
+      console.error("Erro ao buscar sinônimos com IA:", error);
+      res.status(500).json({
+        error: "Ocorreu um erro ao buscar sugestões de sinônimos.",
+        details: error.message
+      });
+    }
+  });
+
   // Serve static files and handle Vite routing
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
